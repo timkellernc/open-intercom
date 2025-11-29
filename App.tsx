@@ -1,117 +1,57 @@
-/**
- * Sample React Native App
- * https://github.com/facebook/react-native
- *
- * @format
- */
+import React, { useState } from 'react';
+import { SafeAreaView, StatusBar, StyleSheet } from 'react-native';
+import { LoginScreen } from './src/screens/LoginScreen';
+import { IntercomScreen } from './src/screens/IntercomScreen';
+import { SettingsModal } from './src/components/SettingsModal';
+import { colors } from './src/constants/theme';
+import { webSocketService } from './src/services/WebSocketService';
+import { audioService } from './src/services/AudioService';
 
-import React from 'react';
-import type {PropsWithChildren} from 'react';
-import {
-  SafeAreaView,
-  ScrollView,
-  StatusBar,
-  StyleSheet,
-  Text,
-  useColorScheme,
-  View,
-} from 'react-native';
+const App = () => {
+  const [currentScreen, setCurrentScreen] = useState<'login' | 'intercom'>('login');
+  const [credentials, setCredentials] = useState({ username: '', serverUrl: '' });
+  const [isSettingsVisible, setIsSettingsVisible] = useState(false);
 
-import {
-  Colors,
-  DebugInstructions,
-  Header,
-  LearnMoreLinks,
-  ReloadInstructions,
-} from 'react-native/Libraries/NewAppScreen';
+  const handleLogin = (username: string, serverUrl: string) => {
+    setCredentials({ username, serverUrl });
+    webSocketService.connect(serverUrl, username);
+    setCurrentScreen('intercom');
+  };
 
-type SectionProps = PropsWithChildren<{
-  title: string;
-}>;
-
-function Section({children, title}: SectionProps): React.JSX.Element {
-  const isDarkMode = useColorScheme() === 'dark';
-  return (
-    <View style={styles.sectionContainer}>
-      <Text
-        style={[
-          styles.sectionTitle,
-          {
-            color: isDarkMode ? Colors.white : Colors.black,
-          },
-        ]}>
-        {title}
-      </Text>
-      <Text
-        style={[
-          styles.sectionDescription,
-          {
-            color: isDarkMode ? Colors.light : Colors.dark,
-          },
-        ]}>
-        {children}
-      </Text>
-    </View>
-  );
-}
-
-function App(): React.JSX.Element {
-  const isDarkMode = useColorScheme() === 'dark';
-
-  const backgroundStyle = {
-    backgroundColor: isDarkMode ? Colors.darker : Colors.lighter,
+  const handleLogout = () => {
+    webSocketService.disconnect();
+    setCredentials({ username: '', serverUrl: '' });
+    setCurrentScreen('login');
   };
 
   return (
-    <SafeAreaView style={backgroundStyle}>
-      <StatusBar
-        barStyle={isDarkMode ? 'light-content' : 'dark-content'}
-        backgroundColor={backgroundStyle.backgroundColor}
-      />
-      <ScrollView
-        contentInsetAdjustmentBehavior="automatic"
-        style={backgroundStyle}>
-        <Header />
-        <View
-          style={{
-            backgroundColor: isDarkMode ? Colors.black : Colors.white,
-          }}>
-          <Section title="Step One">
-            Edit <Text style={styles.highlight}>App.tsx</Text> to change this
-            screen and then come back to see your edits.
-          </Section>
-          <Section title="See Your Changes">
-            <ReloadInstructions />
-          </Section>
-          <Section title="Debug">
-            <DebugInstructions />
-          </Section>
-          <Section title="Learn More">
-            Read the docs to discover what to do next:
-          </Section>
-          <LearnMoreLinks />
-        </View>
-      </ScrollView>
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor={colors.background} />
+      {currentScreen === 'login' ? (
+        <LoginScreen onLogin={handleLogin} />
+      ) : (
+        <>
+          <IntercomScreen
+            username={credentials.username}
+            serverUrl={credentials.serverUrl}
+            onLogout={handleLogout}
+            onOpenSettings={() => setIsSettingsVisible(true)}
+          />
+          <SettingsModal
+            visible={isSettingsVisible}
+            onClose={() => setIsSettingsVisible(false)}
+            onLogout={handleLogout}
+          />
+        </>
+      )}
     </SafeAreaView>
   );
-}
+};
 
 const styles = StyleSheet.create({
-  sectionContainer: {
-    marginTop: 32,
-    paddingHorizontal: 24,
-  },
-  sectionTitle: {
-    fontSize: 24,
-    fontWeight: '600',
-  },
-  sectionDescription: {
-    marginTop: 8,
-    fontSize: 18,
-    fontWeight: '400',
-  },
-  highlight: {
-    fontWeight: '700',
+  container: {
+    flex: 1,
+    backgroundColor: colors.background,
   },
 });
 
