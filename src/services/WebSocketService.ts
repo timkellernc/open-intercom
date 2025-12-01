@@ -17,9 +17,12 @@ class WebSocketService {
     private listeners: { [key: string]: Function[] } = {};
     private pingInterval: NodeJS.Timeout | null = null;
 
-    connect(url: string, username: string) {
+    private codec: string = 'pcm';
+
+    connect(url: string, username: string, codec: string = 'pcm') {
         this.url = url;
         this.username = username;
+        this.codec = codec;
         this.reconnectAttempts = 0;
         this.isReconnecting = false;
         this.initConnection();
@@ -84,7 +87,8 @@ class WebSocketService {
             username: this.username,
             // TODO: Send audio settings (sampleRate, bitDepth)
             sampleRate: 48000,
-            bitDepth: 16
+            bitDepth: 16,
+            codec: this.codec
         });
     }
 

@@ -15,11 +15,13 @@ const App = () => {
   const handleLogin = (username: string, serverUrl: string) => {
     setCredentials({ username, serverUrl });
     webSocketService.connect(serverUrl, username);
+    audioService.start(); // Start audio engine for playback
     setCurrentScreen('intercom');
   };
 
   const handleLogout = () => {
     webSocketService.disconnect();
+    audioService.stop(); // Stop audio engine
     setCredentials({ username: '', serverUrl: '' });
     setCurrentScreen('login');
   };

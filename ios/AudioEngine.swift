@@ -16,75 +16,120 @@ class AudioEngine: RCTEventEmitter {
   private var playerNode: AVAudioPlayerNode!
   private var inputConverter: AVAudioConverter!
   private var outputConverter: AVAudioConverter!
-  private var targetFormat: AVAudioFormat! // 48kHz, 1ch, Int16 (Interleaved)
+  
+  private var processingFormat: AVAudioFormat! // Float32, 48kHz (Internal)
+  private var networkFormat: AVAudioFormat!    // Int16, 48kHz (Network)
   
   private var isRunning = false
+  private var isSetup = false
+  private var micGain: Float = 1.0 // Microphone gain multiplier (default 1.0 = no change)
+  
+  // Opus codec support
+  private var useOpus: Bool = true // Default to Opus
+  private var opusEncoder: OpaquePointer?
+  private var opusDecoder: OpaquePointer?
+  private let opusFrameSize: Int = 960  // 20ms at 48kHz
+  private var opusBitrate: Int32 = 32000 // 32 kbps (Normal quality)
   
   override init() {
     super.init()
-    setupEngine()
+    print("AudioEngine initialized")
   }
   
-  // Required for RCTEventEmitter
   override func supportedEvents() -> [String]! {
     return ["onAudioData"]
   }
   
-  // Required to prevent warning
   override static func requiresMainQueueSetup() -> Bool {
     return false
   }
   
   private func setupEngine() {
+    print("AudioEngine: setupEngine called")
+    if isSetup {
+        print("AudioEngine: Already setup")
+        return
+    }
+    isSetup = true
+    
+    let session = AVAudioSession.sharedInstance()
+    do {
+      print("AudioEngine: Configuring AVAudioSession")
+      // Use .mixWithOthers to allow background audio, remove .defaultToSpeaker to use earpiece/headphones
+      try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker, .mixWithOthers])
+      try session.setActive(true)
+      
+      // Set preferred sample rate and IO buffer duration for better quality
+      try session.setPreferredSampleRate(48000)
+      try session.setPreferredIOBufferDuration(0.005) // 5ms for low latency
+      
+      print("AudioEngine: AVAudioSession active")
+    } catch {
+      print("Failed to setup audio session: \(error)")
+    }
+    
     engine = AVAudioEngine()
     playerNode = AVAudioPlayerNode()
+    
+    // Set player volume to maximum for louder playback
+    playerNode.volume = 2.0 // Boost volume (1.0 is normal, 2.0 is double)
+    
     engine.attach(playerNode)
     
-    // Target format: 48kHz, 1 channel, 16-bit Integer (Common for VoIP)
-    // Note: AVAudioFormat commonFormat .pcmFormatInt16 is not always supported for *processing* nodes directly,
-    // but we use it for the buffer format we exchange with JS.
-    targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 48000, channels: 1, interleaved: true)
+    // Define Formats
+    // Processing: Float32, 48kHz, Non-Interleaved (Standard for AVAudioEngine)
+    processingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)
+    
+    // Network: Int16, 48kHz, Interleaved (Standard for VoIP/Server)
+    networkFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 48000, channels: 1, interleaved: true)
+    
+    print("AudioEngine: Connecting playerNode to mainMixerNode with format: \(String(describing: processingFormat))")
+    engine.connect(playerNode, to: engine.mainMixerNode, format: processingFormat)
     
     let inputNode = engine.inputNode
     let inputFormat = inputNode.inputFormat(forBus: 0)
+    print("AudioEngine: Input format: \(inputFormat)")
     
-    // Connect player to main mixer
-    engine.connect(playerNode, to: engine.mainMixerNode, format: targetFormat)
-    
-    // Setup Input Tap (Microphone)
+    print("AudioEngine: Installing tap on inputNode")
     inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] (buffer, time) in
       guard let self = self, self.isRunning else { return }
       self.processInputBuffer(buffer)
     }
     
-    // Configure Audio Session for VoIP
-    let session = AVAudioSession.sharedInstance()
-    do {
-      try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
-      try session.setActive(true)
-    } catch {
-      print("Failed to set audio session category: \(error)")
+    // Setup Opus encoder/decoder if enabled
+    if useOpus {
+      setupOpusCodec()
     }
+    
+    print("AudioEngine: setupEngine completed")
+  }
+  
+  private func setupOpusCodec() {
+    print("AudioEngine: Opus not yet supported on iOS - using PCM")
+    useOpus = false
+    // TODO: Implement Opus codec for iOS
+    // Will need to either:
+    // 1. Build Opus from source and add to Xcode project
+    // 2. Find a working CocoaPods pod
+    // 3. Use a pre-built xcframework
   }
   
   private func processInputBuffer(_ buffer: AVAudioPCMBuffer) {
-    // Convert from Hardware Format (usually Float32) to Target Format (Int16 48kHz)
-    guard let targetFormat = self.targetFormat else { return }
+    // Convert Input (Float32) -> Network (Int16)
+    guard let networkFormat = self.networkFormat else { return }
     
-    // If formats match, just send
-    if buffer.format == targetFormat {
+    if buffer.format == networkFormat {
       self.sendBuffer(buffer)
       return
     }
     
-    // Otherwise convert
     if inputConverter == nil || inputConverter.inputFormat != buffer.format {
-      inputConverter = AVAudioConverter(from: buffer.format, to: targetFormat)
+      inputConverter = AVAudioConverter(from: buffer.format, to: networkFormat)
     }
     
-    let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+    let ratio = networkFormat.sampleRate / buffer.format.sampleRate
     let capacity = UInt32(Double(buffer.frameCapacity) * ratio)
-    guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+    guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: networkFormat, frameCapacity: capacity) else { return }
     
     var error: NSError? = nil
     let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
@@ -104,20 +149,52 @@ class AudioEngine: RCTEventEmitter {
     
     let channelDataPointer = channelData.pointee
     let frameLength = Int(buffer.frameLength)
-    let data = Data(bytes: channelDataPointer, count: frameLength * 2) // 2 bytes per sample
     
+    // Apply microphone gain if not 1.0
+    var pcmData: [Int16]
+    if micGain != 1.0 {
+      pcmData = [Int16](repeating: 0, count: frameLength)
+      for i in 0..<frameLength {
+        let sample = channelDataPointer[i]
+        let amplified = Float(sample) * micGain
+        pcmData[i] = Int16(max(-32768, min(32767, amplified)))
+      }
+    } else {
+      pcmData = Array(UnsafeBufferPointer(start: channelDataPointer, count: frameLength))
+    }
+    
+    // Encode with Opus if enabled, otherwise send raw PCM
+    if useOpus, let encoder = opusEncoder {
+      encodeAndSendOpus(pcmData: pcmData)
+    } else {
+      // Send raw PCM (Int16)
+      let data = Data(bytes: pcmData, count: frameLength * 2)
+      let base64String = data.base64EncodedString()
+      sendEvent(withName: "onAudioData", body: base64String)
+    }
+  }
+  
+  private func encodeAndSendOpus(pcmData: [Int16]) {
+    // TODO: Implement Opus encoding for iOS
+    print("AudioEngine: Opus encoding not yet supported on iOS")
+    // For now, just send as PCM
+    let data = Data(bytes: pcmData, count: pcmData.count * 2)
     let base64String = data.base64EncodedString()
     sendEvent(withName: "onAudioData", body: base64String)
   }
   
   @objc
   func start() {
+    print("AudioEngine: start() called")
+    setupEngine()
     if !engine.isRunning {
       do {
+        print("AudioEngine: Starting engine")
         try engine.start()
+        print("AudioEngine: Engine started")
         playerNode.play()
+        print("AudioEngine: PlayerNode playing")
         isRunning = true
-        print("AudioEngine started")
       } catch {
         print("Could not start audio engine: \(error)")
       }
@@ -130,36 +207,126 @@ class AudioEngine: RCTEventEmitter {
       engine.stop()
       playerNode.stop()
       isRunning = false
+      
+      // TODO: Cleanup Opus encoders/decoders when implemented
+      // if let encoder = opusEncoder {
+      //   opus_encoder_destroy(encoder)
+      //   opusEncoder = nil
+      // }
+      // if let decoder = opusDecoder {
+      //   opus_decoder_destroy(decoder)
+      //   opusDecoder = nil
+      // }
+      
       print("AudioEngine stopped")
     }
   }
   
+  @objc(setVolume:)
+  func setVolume(_ volume: NSNumber) {
+    let vol = volume.floatValue
+    playerNode.volume = vol
+    print("AudioEngine: Volume set to \(vol)")
+  }
+  
+  @objc(setMicGain:)
+  func setMicGain(_ gain: NSNumber) {
+    micGain = gain.floatValue
+    print("AudioEngine: Mic gain set to \(micGain)")
+  }
+  
+  @objc(setCodec:)
+  func setCodec(_ codec: String) {
+    let wasOpus = useOpus
+    useOpus = (codec == "opus")
+    print("AudioEngine: Codec set to \(codec)")
+    
+    // If switching to Opus and not already setup, create encoder/decoder
+    if useOpus && !wasOpus && opusEncoder == nil {
+      setupOpusCodec()
+    }
+  }
+  
+  @objc(setOpusBitrate:)
+  func setOpusBitrate(_ bitrate: NSNumber) {
+    opusBitrate = bitrate.int32Value
+    print("AudioEngine: Opus bitrate set to \(opusBitrate) (iOS: PCM mode only)")
+    
+    // TODO: Update encoder bitrate when Opus is implemented
+    // if let encoder = opusEncoder {
+    //   let rawEncoder = UnsafeMutableRawPointer(encoder)
+    //   OpusHelper.encoderSetBitrate(rawEncoder, bitrate: opusBitrate)
+    // }
+  }
+  
   @objc(queueAudio:)
   func queueAudio(_ base64String: String) {
-    guard let data = Data(base64Encoded: base64String),
-          let buffer = dataToPCMBuffer(data: data) else {
-      return
+    guard let data = Data(base64Encoded: base64String) else { return }
+    
+    // Decode Opus if enabled, otherwise treat as raw PCM
+    let int16Buffer: AVAudioPCMBuffer?
+    if useOpus, let decoder = opusDecoder {
+      int16Buffer = decodeOpusData(data: data)
+    } else {
+      int16Buffer = dataToInt16Buffer(data: data)
     }
     
-    playerNode.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
+    guard let pcmBuffer = int16Buffer else { return }
+    
+    // Convert Int16 -> Float32 (Processing)
+    guard let processingBuffer = convertToProcessingBuffer(pcmBuffer) else { return }
+    
+    playerNode.scheduleBuffer(processingBuffer, at: nil, options: [], completionHandler: nil)
     
     if !playerNode.isPlaying && engine.isRunning {
         playerNode.play()
     }
   }
   
-  private func dataToPCMBuffer(data: Data) -> AVAudioPCMBuffer? {
-    guard let targetFormat = self.targetFormat else { return nil }
+  private func decodeOpusData(data: Data) -> AVAudioPCMBuffer? {
+    // TODO: Implement Opus decoding for iOS
+    print("AudioEngine: Opus decoding not yet supported on iOS")
+    return nil
+  }
+  
+  private func convertToProcessingBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    guard let processingFormat = self.processingFormat else { return nil }
+    if buffer.format == processingFormat { return buffer }
+    
+    if outputConverter == nil {
+        outputConverter = AVAudioConverter(from: buffer.format, to: processingFormat)
+    }
+    
+    let ratio = processingFormat.sampleRate / buffer.format.sampleRate
+    let capacity = UInt32(Double(buffer.frameCapacity) * ratio)
+    guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: capacity) else { return nil }
+    
+    var error: NSError? = nil
+    let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
+      outStatus.pointee = .haveData
+      return buffer
+    }
+    
+    outputConverter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
+    return error == nil ? outputBuffer : nil
+  }
+  
+  private func dataToInt16Buffer(data: Data) -> AVAudioPCMBuffer? {
+    guard let networkFormat = self.networkFormat else { return nil }
     
     let frameCount = UInt32(data.count) / 2 // 2 bytes per sample
-    guard let buffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCount) else { return nil }
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: networkFormat, frameCapacity: frameCount) else { return nil }
     
     buffer.frameLength = frameCount
     let audioBuffer = buffer.int16ChannelData?.pointee
     
     data.withUnsafeBytes { (rawBufferPointer: UnsafeRawBufferPointer) in
       if let baseAddress = rawBufferPointer.baseAddress, let audioBuffer = audioBuffer {
-        audioBuffer.copyMemory(from: baseAddress.assumingMemoryBound(to: Int16.self), byteCount: data.count)
+        let source = baseAddress.assumingMemoryBound(to: Int16.self)
+        let count = Int(data.count) / 2
+        for i in 0..<count {
+            audioBuffer[i] = source[i]
+        }
       }
     }
     

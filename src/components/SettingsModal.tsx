@@ -11,6 +11,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Slider from '@react-native-community/slider';
 import { colors, spacing, typography } from '../constants/theme';
+import { audioService } from '../services/AudioService';
 
 interface SettingsModalProps {
     visible: boolean;
@@ -26,6 +27,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const [jitterBufferMs, setJitterBufferMs] = useState(50);
     const [isAutoJitter, setIsAutoJitter] = useState(true);
     const [audioQuality, setAudioQuality] = useState('quality'); // eco, balanced, quality
+    const [volume, setVolume] = useState(2.0); // Default 2.0x
+    const [micGain, setMicGain] = useState(1.0); // Default 1.0x (no change)
+
+    const [useOpus, setUseOpus] = useState(true); // Default to Opus
 
     useEffect(() => {
         if (visible) {
@@ -38,10 +43,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             const savedJitter = await AsyncStorage.getItem('jitterBufferMs');
             const savedAuto = await AsyncStorage.getItem('autoJitter');
             const savedQuality = await AsyncStorage.getItem('audioQuality');
+            const savedVolume = await AsyncStorage.getItem('audioVolume');
+            const savedMicGain = await AsyncStorage.getItem('micGain');
+            const savedUseOpus = await AsyncStorage.getItem('useOpus');
 
             if (savedJitter) setJitterBufferMs(parseInt(savedJitter, 10));
             if (savedAuto) setIsAutoJitter(savedAuto === 'true');
-            if (savedQuality) setAudioQuality(savedQuality);
+            if (savedQuality) {
+                setAudioQuality(savedQuality);
+                applyQualitySettings(savedQuality, savedUseOpus !== 'false');
+            }
+            if (savedVolume) {
+                const vol = parseFloat(savedVolume);
+                setVolume(vol);
+                audioService.setVolume(vol);
+            }
+            if (savedMicGain) {
+                const gain = parseFloat(savedMicGain);
+                setMicGain(gain);
+                audioService.setMicGain(gain);
+            }
+            if (savedUseOpus) {
+                const isOpus = savedUseOpus === 'true';
+                setUseOpus(isOpus);
+                audioService.setCodec(isOpus ? 'opus' : 'pcm');
+            } else {
+                // Default to Opus if not saved
+                audioService.setCodec('opus');
+            }
         } catch (error) {
             console.error('Failed to load settings', error);
         }
@@ -52,9 +81,48 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             await AsyncStorage.setItem('jitterBufferMs', jitterBufferMs.toString());
             await AsyncStorage.setItem('autoJitter', isAutoJitter.toString());
             await AsyncStorage.setItem('audioQuality', audioQuality);
+            await AsyncStorage.setItem('audioVolume', volume.toString());
+            await AsyncStorage.setItem('micGain', micGain.toString());
+            await AsyncStorage.setItem('useOpus', useOpus.toString());
         } catch (error) {
             console.error('Failed to save settings', error);
         }
+    };
+
+    const handleVolumeChange = (newVolume: number) => {
+        setVolume(newVolume);
+        audioService.setVolume(newVolume);
+    };
+
+    const handleMicGainChange = (newGain: number) => {
+        setMicGain(newGain);
+        audioService.setMicGain(newGain);
+    };
+
+    const handleOpusChange = (value: boolean) => {
+        setUseOpus(value);
+        audioService.setCodec(value ? 'opus' : 'pcm');
+        // Re-apply quality settings as bitrate depends on codec
+        applyQualitySettings(audioQuality, value);
+    };
+
+    const handleQualityChange = (quality: string) => {
+        setAudioQuality(quality);
+        applyQualitySettings(quality, useOpus);
+    };
+
+    const applyQualitySettings = (quality: string, isOpus: boolean) => {
+        if (isOpus) {
+            let bitrate = 32000;
+            switch (quality) {
+                case 'eco': bitrate = 16000; break;
+                case 'balanced': bitrate = 32000; break;
+                case 'quality': bitrate = 64000; break;
+            }
+            audioService.setOpusBitrate(bitrate);
+        }
+        // For PCM, quality might affect bit depth or sample rate, but we'll stick to 48kHz/16bit for now
+        // or implement downsampling later if needed.
     };
 
     const handleClose = () => {
@@ -118,39 +186,110 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             </View>
                         </View>
 
+                        {/* Volume Control */}
+                        <View style={styles.section}>
+                            <Text style={styles.sectionTitle}>Volume</Text>
+
+                            <View style={styles.sliderContainer}>
+                                <View style={styles.row}>
+                                    <Text style={styles.label}>Playback Volume</Text>
+                                    <Text style={styles.value}>{volume.toFixed(1)}x</Text>
+                                </View>
+                                <Slider
+                                    style={styles.slider}
+                                    minimumValue={0.5}
+                                    maximumValue={4.0}
+                                    step={0.1}
+                                    value={volume}
+                                    onValueChange={handleVolumeChange}
+                                    minimumTrackTintColor={colors.primary}
+                                    maximumTrackTintColor={colors.surface}
+                                    thumbTintColor={'white'}
+                                />
+                                <Text style={styles.optionDesc}>
+                                    Adjust how loud incoming audio sounds (0.5x - 4.0x)
+                                </Text>
+                            </View>
+
+                            <View style={styles.sliderContainer}>
+                                <View style={styles.row}>
+                                    <Text style={styles.label}>Microphone Gain</Text>
+                                    <Text style={styles.value}>{micGain.toFixed(1)}x</Text>
+                                </View>
+                                <Slider
+                                    style={styles.slider}
+                                    minimumValue={0.5}
+                                    maximumValue={3.0}
+                                    step={0.1}
+                                    value={micGain}
+                                    onValueChange={handleMicGainChange}
+                                    minimumTrackTintColor={colors.primary}
+                                    maximumTrackTintColor={colors.surface}
+                                    thumbTintColor={'white'}
+                                />
+                                <Text style={styles.optionDesc}>
+                                    Amplify your microphone before sending (0.5x - 3.0x)
+                                </Text>
+                            </View>
+                        </View>
+
+                        {/* Codec Settings */}
+                        <View style={styles.section}>
+                            <Text style={styles.sectionTitle}>Audio Codec</Text>
+
+                            <View style={styles.row}>
+                                <Text style={styles.label}>Use Opus Codec</Text>
+                                <Switch
+                                    value={useOpus}
+                                    onValueChange={handleOpusChange}
+                                    trackColor={{ false: colors.surface, true: colors.primary }}
+                                    thumbColor={'white'}
+                                />
+                            </View>
+                            <Text style={styles.optionDesc}>
+                                Opus significantly reduces bandwidth usage while maintaining high audio quality.
+                            </Text>
+                        </View>
+
                         {/* Audio Quality Settings */}
                         <View style={styles.section}>
                             <Text style={styles.sectionTitle}>Audio Quality</Text>
 
                             <TouchableOpacity
                                 style={[styles.option, audioQuality === 'eco' && styles.optionSelected]}
-                                onPress={() => setAudioQuality('eco')}
+                                onPress={() => handleQualityChange('eco')}
                             >
                                 <View>
                                     <Text style={styles.optionTitle}>Eco</Text>
-                                    <Text style={styles.optionDesc}>~173 MB/hr (48kHz, 8-bit)</Text>
+                                    <Text style={styles.optionDesc}>
+                                        {useOpus ? '~20 MB/hr (16 kbps)' : '~173 MB/hr (48kHz, 8-bit)'}
+                                    </Text>
                                 </View>
                                 {audioQuality === 'eco' && <View style={styles.checkMark} />}
                             </TouchableOpacity>
 
                             <TouchableOpacity
                                 style={[styles.option, audioQuality === 'balanced' && styles.optionSelected]}
-                                onPress={() => setAudioQuality('balanced')}
+                                onPress={() => handleQualityChange('balanced')}
                             >
                                 <View>
-                                    <Text style={styles.optionTitle}>Balanced</Text>
-                                    <Text style={styles.optionDesc}>~259 MB/hr (48kHz, 12-bit)</Text>
+                                    <Text style={styles.optionTitle}>Normal</Text>
+                                    <Text style={styles.optionDesc}>
+                                        {useOpus ? '~40 MB/hr (32 kbps)' : '~259 MB/hr (48kHz, 12-bit)'}
+                                    </Text>
                                 </View>
                                 {audioQuality === 'balanced' && <View style={styles.checkMark} />}
                             </TouchableOpacity>
 
                             <TouchableOpacity
                                 style={[styles.option, audioQuality === 'quality' && styles.optionSelected]}
-                                onPress={() => setAudioQuality('quality')}
+                                onPress={() => handleQualityChange('quality')}
                             >
                                 <View>
                                     <Text style={styles.optionTitle}>Quality</Text>
-                                    <Text style={styles.optionDesc}>~345 MB/hr (48kHz, 16-bit)</Text>
+                                    <Text style={styles.optionDesc}>
+                                        {useOpus ? '~80 MB/hr (64 kbps)' : '~345 MB/hr (48kHz, 16-bit)'}
+                                    </Text>
                                 </View>
                                 {audioQuality === 'quality' && <View style={styles.checkMark} />}
                             </TouchableOpacity>
