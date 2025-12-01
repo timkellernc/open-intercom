@@ -17,9 +17,17 @@ import androidx.core.app.ActivityCompat;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.Arguments;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import android.os.Handler;
+import android.os.Looper;
+import java.util.ArrayList;
+import java.util.List;
 
 public class AudioEngineModule extends ReactContextBaseJavaModule {
     private static final String TAG = "AudioEngine";
@@ -45,6 +53,26 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
     private boolean useOpus = true; // Default to Opus
     private int opusBitrate = 32000;
     private OpusCodec opusCodec;
+    
+    // Jitter buffer
+    private int jitterBufferMs = 100;  // Default 100ms
+    private boolean isAutoJitter = true;
+    private Queue<AudioPacket> audioQueue = new ConcurrentLinkedQueue<>();
+    private Handler jitterHandler = new Handler(Looper.getMainLooper());
+    private long lastPlayTime = 0;
+    private long lastAdjustTime = System.currentTimeMillis();  // Track when we last adjusted buffer
+    private List<Long> packetArrivalTimes = new ArrayList<>();
+    private Runnable jitterRunnable;
+    
+    private static class AudioPacket {
+        byte[] data;
+        long arrivalTime;
+        
+        AudioPacket(byte[] data, long arrivalTime) {
+            this.data = data;
+            this.arrivalTime = arrivalTime;
+        }
+    }
 
     public AudioEngineModule(ReactApplicationContext reactContext) {
         super(reactContext);
@@ -110,6 +138,7 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
             }
 
             startRecordingThread();
+            startJitterHandler();
             Log.d(TAG, "AudioEngine started");
 
         } catch (Exception e) {
@@ -130,6 +159,13 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
             }
             recordingThread = null;
         }
+        
+        if (jitterHandler != null && jitterRunnable != null) {
+            jitterHandler.removeCallbacks(jitterRunnable);
+            jitterRunnable = null;
+        }
+        audioQueue.clear();
+        packetArrivalTimes.clear();
 
         if (audioRecord != null) {
             try {
@@ -181,28 +217,20 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
         try {
             byte[] audioData = Base64.decode(base64String, Base64.DEFAULT);
             
-            if (useOpus && opusCodec != null) {
-                short[] pcm = opusCodec.decodeFrame(audioData);
-                if (pcm != null) {
-                    // Convert short[] to byte[]
-                    byte[] pcmBytes = new byte[pcm.length * 2];
-                    for (int i = 0; i < pcm.length; i++) {
-                        pcmBytes[i * 2] = (byte) (pcm[i] & 0xff);
-                        pcmBytes[i * 2 + 1] = (byte) ((pcm[i] >> 8) & 0xff);
-                    }
-                    audioData = pcmBytes;
-                } else {
-                    Log.w(TAG, "Opus decoding failed");
-                    return;
-                }
+            // Add to jitter buffer queue
+            long now = System.currentTimeMillis();
+            audioQueue.offer(new AudioPacket(audioData, now));
+            
+            // Track arrival times for auto-adjust
+            packetArrivalTimes.add(now);
+            if (packetArrivalTimes.size() > 100) {
+                packetArrivalTimes.remove(0);
             }
             
-            // Apply volume if not 1.0
-            if (volume != 1.0f) {
-                applyVolumeToBuffer(audioData);
+            // Start jitter handler if not running (should be running from start(), but safety check)
+            if (jitterRunnable == null) {
+                startJitterHandler();
             }
-            
-            audioTrack.write(audioData, 0, audioData.length);
         } catch (Exception e) {
             Log.e(TAG, "Error queuing audio", e);
         }
@@ -239,6 +267,131 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
         Log.d(TAG, "Opus bitrate set to " + bitrate);
         if (opusCodec != null) {
             opusCodec.setBitrate(bitrate);
+        }
+    }
+
+    @ReactMethod
+    public void setJitterBuffer(int ms) {
+        this.jitterBufferMs = ms;
+        Log.d(TAG, "Jitter buffer set to " + ms + "ms");
+    }
+
+    @ReactMethod
+    public void setAutoJitter(boolean enabled) {
+        this.isAutoJitter = enabled;
+        Log.d(TAG, "Auto-adjust jitter " + (enabled ? "enabled" : "disabled"));
+    }
+
+    private void startJitterHandler() {
+        jitterRunnable = new Runnable() {
+            @Override
+            public void run() {
+                processJitterBuffer();
+                jitterHandler.postDelayed(this, 20); // Run every 20ms
+            }
+        };
+        jitterHandler.post(jitterRunnable);
+    }
+
+    private void processJitterBuffer() {
+        if (audioQueue.isEmpty()) return;
+
+        AudioPacket packet = audioQueue.peek();
+        if (packet == null) return;
+
+        long now = System.currentTimeMillis();
+        if (now - packet.arrivalTime >= jitterBufferMs) {
+            audioQueue.poll(); // Remove from queue
+            playAudioPacket(packet);
+            lastPlayTime = now;
+
+            if (isAutoJitter) {
+                adjustBufferSize();
+            }
+        }
+    }
+
+    private void playAudioPacket(AudioPacket packet) {
+        try {
+            byte[] audioData = packet.data;
+            
+            if (useOpus && opusCodec != null) {
+                short[] pcm = opusCodec.decodeFrame(audioData);
+                if (pcm != null) {
+                    // Convert short[] to byte[]
+                    byte[] pcmBytes = new byte[pcm.length * 2];
+                    for (int i = 0; i < pcm.length; i++) {
+                        pcmBytes[i * 2] = (byte) (pcm[i] & 0xff);
+                        pcmBytes[i * 2 + 1] = (byte) ((pcm[i] >> 8) & 0xff);
+                    }
+                    audioData = pcmBytes;
+                } else {
+                    Log.w(TAG, "Opus decoding failed");
+                    return;
+                }
+            }
+            
+            // Apply volume if not 1.0
+            if (volume != 1.0f) {
+                applyVolumeToBuffer(audioData);
+            }
+            
+            if (audioTrack != null) {
+                audioTrack.write(audioData, 0, audioData.length);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error playing audio packet", e);
+        }
+    }
+
+    private void adjustBufferSize() {
+        // Only adjust every 2 seconds
+        if (System.currentTimeMillis() - lastAdjustTime < 2000) return;
+
+        if (packetArrivalTimes.size() < 10) return;
+
+        List<Long> intervals = new ArrayList<>();
+        for (int i = 1; i < packetArrivalTimes.size(); i++) {
+            intervals.add(packetArrivalTimes.get(i) - packetArrivalTimes.get(i - 1));
+        }
+
+        double sum = 0;
+        for (Long interval : intervals) {
+            sum += interval;
+        }
+        double avg = sum / intervals.size();
+
+        double variance = 0;
+        for (Long interval : intervals) {
+            variance += Math.pow(interval - avg, 2);
+        }
+        variance /= intervals.size();
+        double jitter = Math.sqrt(variance);
+
+        // Adjust buffer based on jitter
+        if (jitter < 15 && jitterBufferMs > 50) {
+            // Low jitter - decrease buffer
+            jitterBufferMs = Math.max(jitterBufferMs - 10, 50);
+            Log.d(TAG, "Auto-adjust decreased buffer to " + jitterBufferMs + "ms (jitter: " + (int)jitter + "ms)");
+            lastAdjustTime = System.currentTimeMillis();
+            sendJitterBufferChangeEvent(jitterBufferMs, true);
+        } else if (jitter > 30 && jitterBufferMs < 500) {
+            // High jitter - increase buffer
+            jitterBufferMs = Math.min(jitterBufferMs + 20, 500);
+            Log.d(TAG, "Auto-adjust increased buffer to " + jitterBufferMs + "ms (jitter: " + (int)jitter + "ms)");
+            lastAdjustTime = System.currentTimeMillis();
+            sendJitterBufferChangeEvent(jitterBufferMs, true);
+        }
+    }
+
+    private void sendJitterBufferChangeEvent(int bufferMs, boolean auto) {
+        if (getReactApplicationContext().hasActiveCatalystInstance()) {
+            WritableMap params = Arguments.createMap();
+            params.putInt("bufferMs", bufferMs);
+            params.putBoolean("auto", auto);
+            getReactApplicationContext()
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                    .emit("onJitterBufferChange", params);
         }
     }
 

@@ -22,7 +22,7 @@ class AudioService {
         console.log('AudioService: Setting up listeners');
         // Listen for audio data from native module
         this.eventEmitter!.addListener('onAudioData', (base64Audio: string) => {
-            console.log('AudioService: Received audio data from native, length:', base64Audio.length, 'isRecording:', this.isRecording);
+            // console.log('AudioService: Received audio data from native, length:', base64Audio.length, 'isRecording:', this.isRecording);
             if (this.isRecording) {
                 // Convert base64 to binary and send via WebSocket
                 const binaryData = this.base64ToArrayBuffer(base64Audio);
@@ -103,6 +103,30 @@ class AudioService {
         console.log('AudioService: Setting Opus bitrate to', bitrate);
         if (AudioEngine.setOpusBitrate) {
             AudioEngine.setOpusBitrate(bitrate);
+        }
+    }
+
+    setJitterBuffer(ms: number) {
+        if (!AudioEngine) return;
+        console.log('AudioService: Setting jitter buffer to', ms, 'ms');
+        if (AudioEngine.setJitterBuffer) {
+            AudioEngine.setJitterBuffer(ms);
+        }
+    }
+
+    setAutoJitter(enabled: boolean) {
+        if (!AudioEngine) return;
+        console.log('AudioService: Setting auto jitter to', enabled);
+        if (AudioEngine.setAutoJitter) {
+            AudioEngine.setAutoJitter(enabled);
+        }
+    }
+
+    setPCMBitDepth(bitDepth: number) {
+        if (!AudioEngine) return;
+        console.log('AudioService: Setting PCM bit depth to', bitDepth, 'bits');
+        if (AudioEngine.setPCMBitDepth) {
+            AudioEngine.setPCMBitDepth(bitDepth);
         }
     }
 

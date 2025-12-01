@@ -31,13 +31,74 @@ class AudioEngine: RCTEventEmitter {
   private let opusFrameSize: Int = 960  // 20ms at 48kHz
   private var opusBitrate: Int32 = 32000 // 32 kbps (Normal quality)
   
+  // PCM bit depth control
+  private var pcmBitDepth: Int = 16  // 8, 12, or 16 bits
+  
+  // Jitter buffer
+  private var jitterBufferMs: Int = 100  // Default 100ms
+  private var isAutoJitter: Bool = true
+  private var audioQueue: [(Data, Date)] = []  // Queue of (audio data, arrival time)
+  private var jitterTimer: DispatchSourceTimer?
+  private let jitterQueue = DispatchQueue(label: "com.openintercom.jitter", qos: .userInteractive)
+  private var lastPlayTime: Date?
+  private var lastAdjustTime: Date = Date()  // Track when we last adjusted buffer
+  private var packetArrivalTimes: [TimeInterval] = []  // For auto-adjust
+  private let queueLock = NSLock()
+  
   override init() {
     super.init()
     print("AudioEngine initialized")
   }
   
+  // ... (rest of file)
+
+  private func startJitterTimer() {
+    if jitterTimer != nil { return }
+    
+    print("AudioEngine: Starting jitter timer")
+    let timer = DispatchSource.makeTimerSource(queue: jitterQueue)
+    timer.schedule(deadline: .now(), repeating: 0.02)
+    timer.setEventHandler { [weak self] in
+      self?.processJitterBuffer()
+    }
+    timer.resume()
+    jitterTimer = timer
+  }
+  
+  private func processJitterBuffer() {
+    queueLock.lock()
+    defer { queueLock.unlock() }
+    
+    guard !audioQueue.isEmpty else { return }
+    
+    // Check if oldest packet has been in buffer long enough
+    let (data, arrivalTime) = audioQueue.first!
+    let bufferDelay = TimeInterval(jitterBufferMs) / 1000.0
+    let now = Date()
+    let timeInQueue = now.timeIntervalSince(arrivalTime)
+    
+    // print("AudioEngine: Buffer check - Queue size: \(audioQueue.count), Time in queue: \(String(format: "%.3f", timeInQueue))s, Target delay: \(bufferDelay)s")
+    
+    if timeInQueue >= bufferDelay {
+      // Remove from queue and play
+      audioQueue.removeFirst()
+      queueLock.unlock()  // Unlock before playing
+      
+      // print("AudioEngine: Playing packet from jitter buffer")
+      playAudioData(data)
+      
+      queueLock.lock()  // Re-lock for defer
+      lastPlayTime = now
+      
+      // Auto-adjust buffer size if enabled
+      if isAutoJitter {
+        adjustBufferSize()
+      }
+    }
+  }
+  
   override func supportedEvents() -> [String]! {
-    return ["onAudioData"]
+    return ["onAudioData", "onJitterBufferChange"]
   }
   
   override static func requiresMainQueueSetup() -> Bool {
@@ -167,11 +228,46 @@ class AudioEngine: RCTEventEmitter {
     if useOpus, let encoder = opusEncoder {
       encodeAndSendOpus(pcmData: pcmData)
     } else {
-      // Send raw PCM (Int16)
-      let data = Data(bytes: pcmData, count: frameLength * 2)
-      let base64String = data.base64EncodedString()
+      // Apply bit depth reduction if not 16-bit
+      let finalData: Data
+      if pcmBitDepth == 16 {
+        finalData = Data(bytes: pcmData, count: frameLength * 2)
+      } else if pcmBitDepth == 12 {
+        finalData = reduceTo12Bit(pcmData)
+      } else { // 8-bit
+        finalData = reduceTo8Bit(pcmData)
+      }
+      let base64String = finalData.base64EncodedString()
       sendEvent(withName: "onAudioData", body: base64String)
     }
+  }
+  
+  private func reduceTo12Bit(_ samples: [Int16]) -> Data {
+    // Convert 16-bit to 12-bit by shifting right 4 bits
+    // Pack 2 samples into 3 bytes
+    var result = Data()
+    result.reserveCapacity((samples.count * 3) / 2)
+    
+    for i in stride(from: 0, to: samples.count - 1, by: 2) {
+      let sample1 = UInt16(bitPattern: samples[i] >> 4)  // 12-bit
+      let sample2 = UInt16(bitPattern: samples[i + 1] >> 4)  // 12-bit
+      
+      // Pack: [AAAA AAAA][AAAA BBBB][BBBB BBBB]
+      result.append(UInt8(sample1 & 0xFF))  // Lower 8 bits of sample1
+      result.append(UInt8((sample1 >> 8) | ((sample2 & 0x0F) << 4)))  // Upper 4 of sample1 + lower 4 of sample2
+      result.append(UInt8(sample2 >> 4))  // Upper 8 bits of sample2
+    }
+    return result
+  }
+  
+  private func reduceTo8Bit(_ samples: [Int16]) -> Data {
+    // Convert 16-bit to 8-bit by shifting right 8 bits
+    var result = Data()
+    result.reserveCapacity(samples.count)
+    for sample in samples {
+      result.append(UInt8(truncatingIfNeeded: (sample >> 8) + 128))  // Convert to unsigned 8-bit
+    }
+    return result
   }
   
   private func encodeAndSendOpus(pcmData: [Int16]) {
@@ -207,6 +303,15 @@ class AudioEngine: RCTEventEmitter {
       engine.stop()
       playerNode.stop()
       isRunning = false
+      
+      // Stop jitter timer
+      jitterTimer?.cancel()
+      jitterTimer = nil
+      
+      queueLock.lock()
+      audioQueue.removeAll()
+      packetArrivalTimes.removeAll()
+      queueLock.unlock()
       
       // TODO: Cleanup Opus encoders/decoders when implemented
       // if let encoder = opusEncoder {
@@ -259,10 +364,42 @@ class AudioEngine: RCTEventEmitter {
     // }
   }
   
+  @objc(setPCMBitDepth:)
+  func setPCMBitDepth(_ bitDepth: NSNumber) {
+    let depth = bitDepth.intValue
+    if depth == 8 || depth == 12 || depth == 16 {
+      pcmBitDepth = depth
+      print("AudioEngine: PCM bit depth set to \(pcmBitDepth)-bit")
+    } else {
+      print("AudioEngine: Invalid bit depth \(depth), must be 8, 12, or 16")
+    }
+  }
+  
   @objc(queueAudio:)
   func queueAudio(_ base64String: String) {
     guard let data = Data(base64Encoded: base64String) else { return }
     
+    // Add to jitter buffer queue with arrival timestamp
+    queueLock.lock()
+    audioQueue.append((data, Date()))
+    
+    // Track arrival times for auto-adjust
+    let now = Date().timeIntervalSince1970
+    packetArrivalTimes.append(now)
+    if packetArrivalTimes.count > 100 {
+      packetArrivalTimes.removeFirst()
+    }
+    queueLock.unlock()
+    
+    // Start jitter timer if not already running
+    if jitterTimer == nil {
+      startJitterTimer()
+    }
+  }
+  
+
+  
+  private func playAudioData(_ data: Data) {
     // Decode Opus if enabled, otherwise treat as raw PCM
     let int16Buffer: AVAudioPCMBuffer?
     if useOpus, let decoder = opusDecoder {
@@ -279,8 +416,59 @@ class AudioEngine: RCTEventEmitter {
     playerNode.scheduleBuffer(processingBuffer, at: nil, options: [], completionHandler: nil)
     
     if !playerNode.isPlaying && engine.isRunning {
-        playerNode.play()
+      playerNode.play()
     }
+  }
+  
+  private func adjustBufferSize() {
+    // Only adjust every 2 seconds
+    guard Date().timeIntervalSince(lastAdjustTime) >= 2.0 else { return }
+    
+    // Calculate jitter (variance in packet arrival times)
+    guard packetArrivalTimes.count >= 10 else {
+      print("AudioEngine: Auto-adjust skipped - not enough packets (\(packetArrivalTimes.count))")
+      return
+    }
+    
+    var intervals: [TimeInterval] = []
+    for i in 1..<packetArrivalTimes.count {
+      intervals.append(packetArrivalTimes[i] - packetArrivalTimes[i-1])
+    }
+    
+    let avgInterval = intervals.reduce(0, +) / Double(intervals.count)
+    let variance = intervals.map { pow($0 - avgInterval, 2) }.reduce(0, +) / Double(intervals.count)
+    let jitter = sqrt(variance) * 1000  // Convert to ms
+    
+    print("AudioEngine: Auto-adjust check - jitter: \(Int(jitter))ms, current buffer: \(jitterBufferMs)ms")
+    
+    // Adjust buffer based on jitter
+    if jitter < 15 && jitterBufferMs > 50 {
+      // Low jitter - decrease buffer
+      jitterBufferMs = max(jitterBufferMs - 10, 50)
+      print("AudioEngine: Auto-adjust decreased buffer to \(jitterBufferMs)ms (jitter: \(Int(jitter))ms)")
+      lastAdjustTime = Date()
+      sendEvent(withName: "onJitterBufferChange", body: ["bufferMs": jitterBufferMs, "auto": true])
+    } else if jitter > 30 && jitterBufferMs < 500 {
+      // High jitter - increase buffer
+      jitterBufferMs = min(jitterBufferMs + 20, 500)
+      print("AudioEngine: Auto-adjust increased buffer to \(jitterBufferMs)ms (jitter: \(Int(jitter))ms)")
+      lastAdjustTime = Date()
+      sendEvent(withName: "onJitterBufferChange", body: ["bufferMs": jitterBufferMs, "auto": true])
+    } else {
+      print("AudioEngine: Auto-adjust - no change needed (jitter in stable range)")
+    }
+  }
+  
+  @objc(setJitterBuffer:)
+  func setJitterBuffer(_ ms: NSNumber) {
+    jitterBufferMs = ms.intValue
+    print("AudioEngine: Jitter buffer set to \(jitterBufferMs)ms")
+  }
+  
+  @objc(setAutoJitter:)
+  func setAutoJitter(_ enabled: NSNumber) {
+    isAutoJitter = enabled.boolValue
+    print("AudioEngine: Auto-adjust jitter \(isAutoJitter ? "enabled" : "disabled")")
   }
   
   private func decodeOpusData(data: Data) -> AVAudioPCMBuffer? {

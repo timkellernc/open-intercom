@@ -7,6 +7,8 @@ import {
     TouchableOpacity,
     Switch,
     ScrollView,
+    NativeEventEmitter,
+    NativeModules,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Slider from '@react-native-community/slider';
@@ -38,6 +40,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         }
     }, [visible]);
 
+    // Listen for jitter buffer changes from native module
+    useEffect(() => {
+        const { AudioEngine } = NativeModules;
+        if (!AudioEngine) return;
+
+        const eventEmitter = new NativeEventEmitter(AudioEngine);
+        const subscription = eventEmitter.addListener('onJitterBufferChange', (event) => {
+            console.log('SettingsModal: Jitter buffer changed to', event.bufferMs, 'ms (auto:', event.auto, ')');
+            setJitterBufferMs(event.bufferMs);
+        });
+
+        return () => {
+            subscription.remove();
+        };
+    }, []);
+
     const loadSettings = async () => {
         try {
             const savedJitter = await AsyncStorage.getItem('jitterBufferMs');
@@ -51,25 +69,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             if (savedAuto) setIsAutoJitter(savedAuto === 'true');
             if (savedQuality) {
                 setAudioQuality(savedQuality);
-                applyQualitySettings(savedQuality, savedUseOpus !== 'false');
+                // Don't apply settings here - they're already applied from previous session
             }
             if (savedVolume) {
-                const vol = parseFloat(savedVolume);
-                setVolume(vol);
-                audioService.setVolume(vol);
+                setVolume(parseFloat(savedVolume));
+                // Don't call audioService.setVolume here - only update UI state
             }
             if (savedMicGain) {
-                const gain = parseFloat(savedMicGain);
-                setMicGain(gain);
-                audioService.setMicGain(gain);
+                setMicGain(parseFloat(savedMicGain));
+                // Don't call audioService.setMicGain here - only update UI state
             }
             if (savedUseOpus) {
-                const isOpus = savedUseOpus === 'true';
-                setUseOpus(isOpus);
-                audioService.setCodec(isOpus ? 'opus' : 'pcm');
-            } else {
-                // Default to Opus if not saved
-                audioService.setCodec('opus');
+                setUseOpus(savedUseOpus === 'true');
+                // Don't call audioService.setCodec here - only update UI state
             }
         } catch (error) {
             console.error('Failed to load settings', error);
@@ -135,6 +147,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         onClose();
     };
 
+    const handleJitterChange = (value: number) => {
+        setJitterBufferMs(value);
+        audioService.setJitterBuffer(value);
+    };
+
+    const handleAutoJitterToggle = (value: boolean) => {
+        setIsAutoJitter(value);
+        audioService.setAutoJitter(value);
+    };
+
     return (
         <Modal
             visible={visible}
@@ -160,7 +182,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                 <Text style={styles.label}>Auto-adjust</Text>
                                 <Switch
                                     value={isAutoJitter}
-                                    onValueChange={setIsAutoJitter}
+                                    onValueChange={handleAutoJitterToggle}
                                     trackColor={{ false: colors.surface, true: colors.primary }}
                                     thumbColor={'white'}
                                 />
@@ -177,7 +199,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                     maximumValue={500}
                                     step={10}
                                     value={jitterBufferMs}
-                                    onValueChange={setJitterBufferMs}
+                                    onValueChange={handleJitterChange}
                                     disabled={isAutoJitter}
                                     minimumTrackTintColor={colors.primary}
                                     maximumTrackTintColor={colors.surface}
