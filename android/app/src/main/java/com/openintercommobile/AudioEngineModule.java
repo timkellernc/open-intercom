@@ -54,6 +54,9 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
     private int opusBitrate = 32000;
     private OpusCodec opusCodec;
     
+    // PCM bit depth control
+    private int pcmBitDepth = 16;  // 8, 12, or 16 bits
+    
     // Jitter buffer
     private int jitterBufferMs = 100;  // Default 100ms
     private boolean isAutoJitter = true;
@@ -62,7 +65,16 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
     private long lastPlayTime = 0;
     private long lastAdjustTime = System.currentTimeMillis();  // Track when we last adjusted buffer
     private List<Long> packetArrivalTimes = new ArrayList<>();
+    private List<Long> packetArrivalTimes = new ArrayList<>();
     private Runnable jitterRunnable;
+    private Runnable jitterRunnable;
+    private long lastLevelSendTime = 0;
+    
+    // New Jitter Buffer Logic
+    private boolean isBuffering = true;
+    private long bufferedDurationMs = 0;
+    private long lastUnderrunTime = System.currentTimeMillis();
+    private int underrunCount = 0;
     
     private static class AudioPacket {
         byte[] data;
@@ -228,9 +240,12 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
             }
             
             // Start jitter handler if not running (should be running from start(), but safety check)
-            if (jitterRunnable == null) {
-                startJitterHandler();
-            }
+            // if (jitterRunnable == null) {
+            //     startJitterHandler();
+            // }
+            
+            // Process queue immediately
+            processAudioQueue();
         } catch (Exception e) {
             Log.e(TAG, "Error queuing audio", e);
         }
@@ -271,14 +286,12 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
-    public void setJitterBuffer(int ms) {
-        this.jitterBufferMs = ms;
-        Log.d(TAG, "Jitter buffer set to " + ms + "ms");
-    }
-
-    @ReactMethod
-    public void setAutoJitter(boolean enabled) {
-        this.isAutoJitter = enabled;
+    public void setPCMBitDepth(int bitDepth) {
+        if (bitDepth == 8 || bitDepth == 12 || bitDepth == 16) {
+            this.pcmBitDepth = bitDepth;
+            Log.d(TAG, "PCM bit depth set to " + bitDepth + "-bit");
+        } else {
+            Log.e(TAG, "Invalid bit depth " + bitDepth + ", must be 8, 12, or 16");
         Log.d(TAG, "Auto-adjust jitter " + (enabled ? "enabled" : "disabled"));
     }
 
@@ -293,20 +306,61 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
         jitterHandler.post(jitterRunnable);
     }
 
-    private void processJitterBuffer() {
-        if (audioQueue.isEmpty()) return;
-
-        AudioPacket packet = audioQueue.peek();
-        if (packet == null) return;
-
-        long now = System.currentTimeMillis();
-        if (now - packet.arrivalTime >= jitterBufferMs) {
-            audioQueue.poll(); // Remove from queue
-            playAudioPacket(packet);
-            lastPlayTime = now;
-
-            if (isAutoJitter) {
-                adjustBufferSize();
+    private void processAudioQueue() {
+        synchronized (audioQueue) {
+            // Calculate current buffered duration
+            if (useOpus) {
+                // For Opus, assume ~20ms per packet
+                bufferedDurationMs = audioQueue.size() * 20;
+            } else {
+                // For PCM, calculate exact duration based on bytes
+                long totalBytes = 0;
+                for (AudioPacket packet : audioQueue) {
+                    totalBytes += packet.data.length;
+                }
+                
+                int bytesPerSample = pcmBitDepth / 8;
+                // 48kHz, 1 channel
+                long bytesPerSecond = 48000 * 1 * bytesPerSample;
+                bufferedDurationMs = (totalBytes * 1000) / bytesPerSecond;
+            }
+            
+            if (isBuffering) {
+                if (bufferedDurationMs >= jitterBufferMs) {
+                    Log.d(TAG, "Buffer full (" + bufferedDurationMs + "ms >= " + jitterBufferMs + "ms), starting playback");
+                    isBuffering = false;
+                    flushQueueToPlayer();
+                }
+            } else {
+                // Not buffering, just play what we have
+                flushQueueToPlayer();
+            }
+        }
+    }
+    
+    private void flushQueueToPlayer() {
+        while (!audioQueue.isEmpty()) {
+            AudioPacket packet = audioQueue.poll();
+            if (packet != null) {
+                playAudioPacket(packet);
+            }
+        }
+    }
+    
+    private void handleUnderrun() {
+        synchronized (audioQueue) {
+            if (!isBuffering) {
+                Log.d(TAG, "Underrun detected! Re-buffering...");
+                isBuffering = true;
+                underrunCount++;
+                lastUnderrunTime = System.currentTimeMillis();
+                
+                // Auto-adjust: Increase buffer if we hit underrun
+                if (isAutoJitter && jitterBufferMs < 500) {
+                    jitterBufferMs = Math.min(jitterBufferMs + 50, 500);
+                    Log.d(TAG, "Auto-adjust increased buffer to " + jitterBufferMs + "ms due to underrun");
+                    sendJitterBufferChangeEvent(jitterBufferMs, true);
+                }
             }
         }
     }
@@ -329,6 +383,14 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
                     Log.w(TAG, "Opus decoding failed");
                     return;
                 }
+            } else {
+                // PCM decoding - expand to 16-bit if needed
+                if (pcmBitDepth == 8) {
+                    audioData = expandFrom8Bit(audioData);
+                } else if (pcmBitDepth == 12) {
+                    audioData = expandFrom12Bit(audioData);
+                }
+                // 16-bit is already in the correct format
             }
             
             // Apply volume if not 1.0
@@ -345,41 +407,16 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
     }
 
     private void adjustBufferSize() {
-        // Only adjust every 2 seconds
-        if (System.currentTimeMillis() - lastAdjustTime < 2000) return;
-
-        if (packetArrivalTimes.size() < 10) return;
-
-        List<Long> intervals = new ArrayList<>();
-        for (int i = 1; i < packetArrivalTimes.size(); i++) {
-            intervals.add(packetArrivalTimes.get(i) - packetArrivalTimes.get(i - 1));
-        }
-
-        double sum = 0;
-        for (Long interval : intervals) {
-            sum += interval;
-        }
-        double avg = sum / intervals.size();
-
-        double variance = 0;
-        for (Long interval : intervals) {
-            variance += Math.pow(interval - avg, 2);
-        }
-        variance /= intervals.size();
-        double jitter = Math.sqrt(variance);
-
-        // Adjust buffer based on jitter
-        if (jitter < 15 && jitterBufferMs > 50) {
-            // Low jitter - decrease buffer
+        // Only decrease buffer if stable for a long time
+        // Increase is handled by handleUnderrun
+        
+        if (System.currentTimeMillis() - lastUnderrunTime < 30000) return;
+        
+        // If we haven't had an underrun in 30s, try decreasing buffer slowly
+        if (jitterBufferMs > 50) {
             jitterBufferMs = Math.max(jitterBufferMs - 10, 50);
-            Log.d(TAG, "Auto-adjust decreased buffer to " + jitterBufferMs + "ms (jitter: " + (int)jitter + "ms)");
-            lastAdjustTime = System.currentTimeMillis();
-            sendJitterBufferChangeEvent(jitterBufferMs, true);
-        } else if (jitter > 30 && jitterBufferMs < 500) {
-            // High jitter - increase buffer
-            jitterBufferMs = Math.min(jitterBufferMs + 20, 500);
-            Log.d(TAG, "Auto-adjust increased buffer to " + jitterBufferMs + "ms (jitter: " + (int)jitter + "ms)");
-            lastAdjustTime = System.currentTimeMillis();
+            Log.d(TAG, "Auto-adjust decreased buffer to " + jitterBufferMs + "ms (stable for >30s)");
+            lastUnderrunTime = System.currentTimeMillis(); // Reset timer so we don't decrease too fast
             sendJitterBufferChangeEvent(jitterBufferMs, true);
         }
     }
@@ -437,6 +474,24 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
                             System.arraycopy(buffer, 0, processBuffer, 0, read);
                         }
                         
+                        // Calculate and send audio level (throttled)
+                        long now = System.currentTimeMillis();
+                        if (now - lastLevelSendTime >= 100) { // 100ms throttle
+                            int maxAmp = 0;
+                            // processBuffer is byte[], need to treat as short[]
+                            for (int i = 0; i < read - 1; i += 2) {
+                                int sample = (processBuffer[i + 1] << 8) | (processBuffer[i] & 0xFF);
+                                int absSample = Math.abs(sample);
+                                if (absSample > maxAmp) {
+                                    maxAmp = absSample;
+                                }
+                            }
+                            // Normalize to 0.0 - 1.0
+                            double level = (double) maxAmp / 32768.0;
+                            sendEvent("onAudioLevel", String.valueOf(level)); // Sending as string to avoid type issues, or could send double if supported
+                            lastLevelSendTime = now;
+                        }
+                        
                         if (useOpus && opusCodec != null) {
                             // Convert byte[] to short[]
                             short[] pcm = new short[read / 2];
@@ -450,7 +505,17 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
                                 sendEvent("onAudioData", base64Data);
                             }
                         } else {
-                            String base64Data = Base64.encodeToString(processBuffer, Base64.NO_WRAP);
+                            // PCM encoding - reduce bit depth if needed
+                            byte[] finalData;
+                            if (pcmBitDepth == 16) {
+                                finalData = processBuffer;
+                            } else if (pcmBitDepth == 12) {
+                                finalData = reduceTo12Bit(processBuffer);
+                            } else { // 8-bit
+                                finalData = reduceTo8Bit(processBuffer);
+                            }
+                            
+                            String base64Data = Base64.encodeToString(finalData, Base64.NO_WRAP);
                             sendEvent("onAudioData", base64Data);
                         }
                     }
@@ -466,5 +531,103 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
                     .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                     .emit(eventName, data);
         }
+    }
+
+    private byte[] reduceTo8Bit(byte[] buffer) {
+        int sampleCount = buffer.length / 2;
+        byte[] result = new byte[sampleCount];
+        
+        for (int i = 0; i < sampleCount; i++) {
+            // Little endian
+            int low = buffer[i * 2] & 0xFF;
+            int high = buffer[i * 2 + 1]; // signed byte
+            int sample = (high << 8) | low; // 16-bit signed
+            
+            // Convert to 8-bit unsigned: (sample >> 8) + 128
+            int val = (sample >> 8) + 128;
+            result[i] = (byte) (val & 0xFF);
+        }
+        return result;
+    }
+
+    private byte[] reduceTo12Bit(byte[] buffer) {
+        int sampleCount = buffer.length / 2;
+        // 3 bytes for every 2 samples
+        int resultLen = (sampleCount * 3) / 2;
+        byte[] result = new byte[resultLen];
+        
+        int resultIdx = 0;
+        for (int i = 0; i < sampleCount - 1; i += 2) {
+            // Sample 1
+            int low1 = buffer[i * 2] & 0xFF;
+            int high1 = buffer[i * 2 + 1];
+            int sample1 = (high1 << 8) | low1;
+            
+            // Sample 2
+            int low2 = buffer[(i + 1) * 2] & 0xFF;
+            int high2 = buffer[(i + 1) * 2 + 1];
+            int sample2 = (high2 << 8) | low2;
+            
+            // 12-bit conversion (shift right 4)
+            int val1 = (sample1 >> 4) & 0xFFF;
+            int val2 = (sample2 >> 4) & 0xFFF;
+            
+            // Pack: [AAAA AAAA][AAAA BBBB][BBBB BBBB]
+            result[resultIdx++] = (byte) (val1 & 0xFF); // Lower 8 of val1
+            result[resultIdx++] = (byte) (((val1 >> 8) & 0x0F) | ((val2 & 0x0F) << 4)); // Upper 4 of val1 | Lower 4 of val2
+            result[resultIdx++] = (byte) ((val2 >> 4) & 0xFF); // Upper 8 of val2
+        }
+        return result;
+    }
+
+    private byte[] expandFrom8Bit(byte[] buffer) {
+        int sampleCount = buffer.length;
+        byte[] result = new byte[sampleCount * 2];
+        
+        for (int i = 0; i < sampleCount; i++) {
+            int val = buffer[i] & 0xFF; // Unsigned 8-bit
+            // Convert back to 16-bit signed: (val - 128) << 8
+            int sample = (val - 128) << 8;
+            
+            result[i * 2] = (byte) (sample & 0xFF);
+            result[i * 2 + 1] = (byte) ((sample >> 8) & 0xFF);
+        }
+        return result;
+    }
+
+    private byte[] expandFrom12Bit(byte[] buffer) {
+        // 3 bytes -> 2 samples
+        int sampleCount = (buffer.length * 2) / 3;
+        byte[] result = new byte[sampleCount * 2];
+        
+        int resultIdx = 0;
+        for (int i = 0; i < buffer.length - 2; i += 3) {
+            int b1 = buffer[i] & 0xFF;
+            int b2 = buffer[i + 1] & 0xFF;
+            int b3 = buffer[i + 2] & 0xFF;
+            
+            // Unpack
+            // val1: [b2_low4][b1]
+            // val2: [b3][b2_high4]
+            
+            int val1 = b1 | ((b2 & 0x0F) << 8);
+            int val2 = ((b2 & 0xF0) >> 4) | (b3 << 4);
+            
+            // Convert to 16-bit (shift left 4)
+            // Sign extension? 12-bit is signed.
+            // If bit 11 is set, it's negative.
+            if ((val1 & 0x800) != 0) val1 |= 0xF000;
+            if ((val2 & 0x800) != 0) val2 |= 0xF000;
+            
+            short sample1 = (short) (val1 << 4);
+            short sample2 = (short) (val2 << 4);
+            
+            result[resultIdx++] = (byte) (sample1 & 0xFF);
+            result[resultIdx++] = (byte) ((sample1 >> 8) & 0xFF);
+            
+            result[resultIdx++] = (byte) (sample2 & 0xFF);
+            result[resultIdx++] = (byte) ((sample2 >> 8) & 0xFF);
+        }
+        return result;
     }
 }

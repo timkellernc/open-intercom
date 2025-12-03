@@ -1,4 +1,5 @@
 import { NativeModules, NativeEventEmitter } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { webSocketService } from './WebSocketService';
 
 console.log('Available NativeModules:', Object.keys(NativeModules));
@@ -16,24 +17,77 @@ class AudioService {
         }
         this.eventEmitter = new NativeEventEmitter(AudioEngine);
         this.setupListeners();
+        this.loadSettings();
+    }
+
+    private async loadSettings() {
+        if (!AudioEngine) return;
+        try {
+            console.log('AudioService: Loading settings from storage');
+            const savedVolume = await AsyncStorage.getItem('audioVolume');
+            const savedMicGain = await AsyncStorage.getItem('micGain');
+            const savedUseOpus = await AsyncStorage.getItem('useOpus');
+            const savedJitter = await AsyncStorage.getItem('jitterBufferMs');
+            const savedAuto = await AsyncStorage.getItem('autoJitter');
+            const savedQuality = await AsyncStorage.getItem('audioQuality');
+
+            if (savedVolume) this.setVolume(parseFloat(savedVolume));
+            if (savedMicGain) this.setMicGain(parseFloat(savedMicGain));
+
+            const useOpus = savedUseOpus === 'true'; // Default false if null, but UI defaults true. Let's assume true if null? UI defaults to true.
+            // Actually, let's just respect what's saved or default to true if null
+            const isOpus = savedUseOpus !== 'false';
+            this.setCodec(isOpus ? 'opus' : 'pcm');
+
+            if (savedJitter) this.setJitterBuffer(parseInt(savedJitter, 10));
+            if (savedAuto) this.setAutoJitter(savedAuto === 'true');
+
+            // Apply quality settings
+            const quality = savedQuality || 'quality';
+            if (isOpus) {
+                let bitrate = 32000;
+                switch (quality) {
+                    case 'eco': bitrate = 16000; break;
+                    case 'balanced': bitrate = 32000; break;
+                    case 'quality': bitrate = 64000; break;
+                }
+                this.setOpusBitrate(bitrate);
+            } else {
+                let bitDepth = 16;
+                switch (quality) {
+                    case 'eco': bitDepth = 8; break;
+                    case 'balanced': bitDepth = 12; break;
+                    case 'quality': bitDepth = 16; break;
+                }
+                this.setPCMBitDepth(bitDepth);
+            }
+
+            console.log('AudioService: Settings loaded');
+        } catch (error) {
+            console.error('AudioService: Failed to load settings', error);
+        }
     }
 
     private setupListeners() {
         console.log('AudioService: Setting up listeners');
         // Listen for audio data from native module
         this.eventEmitter!.addListener('onAudioData', (base64Audio: string) => {
-            // console.log('AudioService: Received audio data from native, length:', base64Audio.length, 'isRecording:', this.isRecording);
             if (this.isRecording) {
                 // Convert base64 to binary and send via WebSocket
                 const binaryData = this.base64ToArrayBuffer(base64Audio);
-                console.log('AudioService: Sending audio to WebSocket, bytes:', binaryData.byteLength);
+                // console.log('AudioService: Sending audio to WebSocket, bytes:', binaryData.byteLength);
                 webSocketService.sendAudio(binaryData);
             }
         });
 
+        // Listen for native logs
+        this.eventEmitter!.addListener('onLog', (message: string) => {
+            console.log(`[Native] ${message}`);
+        });
+
         // Listen for incoming audio from WebSocket
         webSocketService.on('audio', (audioData: ArrayBuffer) => {
-            console.log('AudioService: Received audio from WebSocket, bytes:', audioData.byteLength);
+            // console.log('AudioService: Received audio from WebSocket, bytes:', audioData.byteLength);
             this.playAudio(audioData);
         });
         console.log('AudioService: Listeners setup complete');
@@ -55,12 +109,10 @@ class AudioService {
 
     playAudio(audioData: ArrayBuffer) {
         if (!AudioEngine) return;
-        console.log('AudioService: playAudio called with', audioData.byteLength, 'bytes');
+        // console.log('AudioService: playAudio called with', audioData.byteLength, 'bytes');
         // Convert ArrayBuffer to base64 for native module
         const base64Audio = this.arrayBufferToBase64(audioData);
-        console.log('AudioService: Converted to base64, length:', base64Audio.length);
         AudioEngine.queueAudio(base64Audio);
-        console.log('AudioService: Queued audio to native');
     }
 
     start() {

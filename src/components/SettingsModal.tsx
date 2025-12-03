@@ -31,28 +31,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const [audioQuality, setAudioQuality] = useState('quality'); // eco, balanced, quality
     const [volume, setVolume] = useState(2.0); // Default 2.0x
     const [micGain, setMicGain] = useState(1.0); // Default 1.0x (no change)
+    const [audioLevel, setAudioLevel] = useState(0.0);
 
     const [useOpus, setUseOpus] = useState(true); // Default to Opus
 
-    useEffect(() => {
-        if (visible) {
-            loadSettings();
-        }
-    }, [visible]);
 
+
+    // Listen for jitter buffer changes from native module
     // Listen for jitter buffer changes from native module
     useEffect(() => {
         const { AudioEngine } = NativeModules;
         if (!AudioEngine) return;
 
         const eventEmitter = new NativeEventEmitter(AudioEngine);
-        const subscription = eventEmitter.addListener('onJitterBufferChange', (event) => {
+
+        const jitterSubscription = eventEmitter.addListener('onJitterBufferChange', (event) => {
             console.log('SettingsModal: Jitter buffer changed to', event.bufferMs, 'ms (auto:', event.auto, ')');
             setJitterBufferMs(event.bufferMs);
         });
 
+        const levelSubscription = eventEmitter.addListener('onAudioLevel', (level: number | string) => {
+            // Android sends string, iOS sends number
+            const val = typeof level === 'string' ? parseFloat(level) : level;
+            setAudioLevel(val);
+        });
+
         return () => {
-            subscription.remove();
+            jitterSubscription.remove();
+            levelSubscription.remove();
         };
     }, []);
 
@@ -87,6 +93,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             console.error('Failed to load settings', error);
         }
     };
+
+    useEffect(() => {
+        if (visible) {
+            loadSettings();
+        }
+    }, [visible]);
 
     const saveSettings = async () => {
         try {
@@ -132,9 +144,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 case 'quality': bitrate = 64000; break;
             }
             audioService.setOpusBitrate(bitrate);
+        } else {
+            let bitDepth = 16;
+            switch (quality) {
+                case 'eco': bitDepth = 8; break;
+                case 'balanced': bitDepth = 12; break;
+                case 'quality': bitDepth = 16; break;
+            }
+            audioService.setPCMBitDepth(bitDepth);
         }
-        // For PCM, quality might affect bit depth or sample rate, but we'll stick to 48kHz/16bit for now
-        // or implement downsampling later if needed.
     };
 
     const handleClose = () => {
@@ -148,6 +166,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     };
 
     const handleJitterChange = (value: number) => {
+        setJitterBufferMs(value);
+    };
+
+    const handleJitterChangeComplete = (value: number) => {
         setJitterBufferMs(value);
         audioService.setJitterBuffer(value);
     };
@@ -195,11 +217,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                 </View>
                                 <Slider
                                     style={styles.slider}
-                                    minimumValue={0}
+                                    minimumValue={40}
                                     maximumValue={500}
-                                    step={10}
+                                    step={20}
                                     value={jitterBufferMs}
                                     onValueChange={handleJitterChange}
+                                    onSlidingComplete={handleJitterChangeComplete}
                                     disabled={isAutoJitter}
                                     minimumTrackTintColor={colors.primary}
                                     maximumTrackTintColor={colors.surface}
@@ -252,6 +275,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                 <Text style={styles.optionDesc}>
                                     Amplify your microphone before sending (0.5x - 3.0x)
                                 </Text>
+
+                                <View style={styles.meterContainer}>
+                                    <View style={[styles.meterBar, { width: `${Math.min(audioLevel * 100, 100)}%`, backgroundColor: audioLevel > 0.8 ? colors.error : audioLevel > 0.5 ? colors.warning : colors.success }]} />
+                                </View>
                             </View>
                         </View>
 
@@ -434,5 +461,18 @@ const styles = StyleSheet.create({
         color: colors.error,
         fontWeight: 'bold',
         fontSize: 16,
+    },
+    meterContainer: {
+        height: 10,
+        backgroundColor: colors.surface,
+        borderRadius: 5,
+        marginTop: spacing.sm,
+        overflow: 'hidden',
+        borderWidth: 1,
+        borderColor: colors.border,
+    },
+    meterBar: {
+        height: '100%',
+        backgroundColor: colors.success,
     },
 });

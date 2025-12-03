@@ -7,6 +7,7 @@ export const colors = {
     textSecondary: '#94a3b8', // slate-400
     border: 'rgba(255, 255, 255, 0.1)',
     success: '#10b981',    // emerald-500
+    warning: '#f59e0b',    // amber-500
     error: '#ef4444',      // red-500
     talking: '#ef4444',    // red-500 (for PTT button active)
     listening: '#3b82f6',  // blue-500 (for PTT button inactive)

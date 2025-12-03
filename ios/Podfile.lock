@@ -1623,6 +1623,7 @@ PODS:
     - ReactCommon/turbomodule/core
     - Yoga
   - SocketRocket (0.7.1)
+  - YbridOpus (0.8.0)
   - Yoga (0.0.0)
 
 DEPENDENCIES:
@@ -1695,12 +1696,14 @@ DEPENDENCIES:
   - ReactCommon/turbomodule/core (from `../node_modules/react-native/ReactCommon`)
   - "RNCAsyncStorage (from `../node_modules/@react-native-async-storage/async-storage`)"
   - RNSVG (from `../node_modules/react-native-svg`)
+  - YbridOpus (~> 0.8.0)
   - Yoga (from `../node_modules/react-native/ReactCommon/yoga`)
 
 SPEC REPOS:
   trunk:
     - JitsiWebRTC
     - SocketRocket
+    - YbridOpus
 
 EXTERNAL SOURCES:
   boost:
@@ -1911,8 +1914,9 @@ SPEC CHECKSUMS:
   RNCAsyncStorage: f27db574d8d0d56438ec4e9ba345872f2d0f29f4
   RNSVG: 6c28e67e413fbd28687f23738f6a06e4eee551bb
   SocketRocket: d4aabe649be1e368d1318fdf28a022d714d65748
+  YbridOpus: e9af373b9b38acff3702d9a3bd97cae3c232887c
   Yoga: f8ec45ce98bba1bc93dd28f2ee37215180e6d2b6
 
-PODFILE CHECKSUM: 59527493e1c032bccd69fa7b099575cb68506872
+PODFILE CHECKSUM: cd462ceb25379bf6ff6b602f77f412d6925888b2
 
 COCOAPODS: 1.16.2

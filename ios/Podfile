@@ -23,7 +23,8 @@ target 'OpenIntercomMobile' do
     :app_path => "#{Pod::Config.instance.installation_root}/.."
   )
 
-
+  # Opus codec for audio compression (XCFramework supports all architectures)
+  pod 'YbridOpus', '~> 0.8.0'
 
   target 'OpenIntercomMobileTests' do
     inherit! :complete
@@ -38,5 +39,13 @@ target 'OpenIntercomMobile' do
       :mac_catalyst_enabled => false,
       # :ccache_enabled => true
     )
+    
+    # Exclude arm64 simulator architecture for YbridOpus compatibility
+    # YbridOpus XCFramework only supports i386/x86_64 for simulator
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        config.build_settings['EXCLUDED_ARCHS[sdk=iphonesimulator*]'] = 'arm64'
+      end
+    end
   end
 end
