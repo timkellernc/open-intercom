@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { colors, spacing, typography } from '../constants/theme';
+import { webSocketService } from '../services/WebSocketService';
 
 interface LoginScreenProps {
     onLogin: (username: string, serverUrl: string) => void;
@@ -49,10 +50,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
             return;
         }
 
-        // Auto-prepend ws:// if missing
-        if (!formattedUrl.startsWith('ws://') && !formattedUrl.startsWith('wss://')) {
-            formattedUrl = `ws://${formattedUrl}`;
-        }
+
 
         setIsLoading(true);
 
@@ -60,13 +58,50 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
             await AsyncStorage.setItem('username', username);
             await AsyncStorage.setItem('serverUrl', formattedUrl);
 
-            // Simulate connection delay or validation if needed
-            // For now, just pass the values up
+            // Auto-prepend ws:// if missing
+            if (!formattedUrl.startsWith('ws://') && !formattedUrl.startsWith('wss://')) {
+                formattedUrl = `ws://${formattedUrl}`;
+            }
+
+            // Start connection
             onLogin(username, formattedUrl);
-        } catch (error) {
-            Alert.alert('Error', 'Failed to save settings');
-        } finally {
-            setIsLoading(false);
+
+            // Wait for connection or timeout
+            await new Promise<void>((resolve, reject) => {
+                let timeoutId: NodeJS.Timeout;
+
+                const cleanup = () => {
+                    clearTimeout(timeoutId);
+                    webSocketService.off('connected', onConnected);
+                    webSocketService.off('error', onError);
+                    webSocketService.off('login_error', onError);
+                };
+
+                const onConnected = () => {
+                    cleanup();
+                    resolve();
+                };
+
+                const onError = (err: any) => {
+                    cleanup();
+                    reject(new Error(err?.message || 'Connection failed'));
+                };
+
+                // 5 second timeout
+                timeoutId = setTimeout(() => {
+                    cleanup();
+                    reject(new Error('Connection timed out'));
+                }, 5000);
+
+                webSocketService.on('connected', onConnected);
+                webSocketService.on('error', onError);
+                webSocketService.on('login_error', onError);
+            });
+
+        } catch (error: any) {
+            Alert.alert('Error', error.message);
+            webSocketService.disconnect(); // Cancel connection attempt
+            setIsLoading(false); // Only stop loading on error (on success, component unmounts)
         }
     };
 

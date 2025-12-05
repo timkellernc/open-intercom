@@ -11,6 +11,7 @@ import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.NoiseSuppressor;
 import android.util.Base64;
 import android.util.Log;
+import android.content.Intent;
 
 import androidx.core.app.ActivityCompat;
 
@@ -35,7 +36,7 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
     private static final int CHANNEL_CONFIG_IN = AudioFormat.CHANNEL_IN_MONO;
     private static final int CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_MONO;
     private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
-    private static final int BUFFER_SIZE_FACTOR = 2;
+    private static final int BUFFER_SIZE_FACTOR = 4;
 
     private AudioRecord audioRecord;
     private AudioTrack audioTrack;
@@ -65,8 +66,6 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
     private long lastPlayTime = 0;
     private long lastAdjustTime = System.currentTimeMillis();  // Track when we last adjusted buffer
     private List<Long> packetArrivalTimes = new ArrayList<>();
-    private List<Long> packetArrivalTimes = new ArrayList<>();
-    private Runnable jitterRunnable;
     private Runnable jitterRunnable;
     private long lastLevelSendTime = 0;
     
@@ -95,6 +94,17 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
         return "AudioEngine";
     }
 
+    // Required for NativeEventEmitter
+    @ReactMethod
+    public void addListener(String eventName) {
+        // Keep: Required for RN built-in Event Emitter Calls.
+    }
+
+    @ReactMethod
+    public void removeListeners(Integer count) {
+        // Keep: Required for RN built-in Event Emitter Calls.
+    }
+
     @ReactMethod
     public void start() {
         if (isRunning.get()) return;
@@ -107,7 +117,8 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
         try {
             // Initialize AudioRecord
             minBufferSizeIn = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG_IN, AUDIO_FORMAT);
-            audioRecord = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, SAMPLE_RATE, CHANNEL_CONFIG_IN, AUDIO_FORMAT, minBufferSizeIn * BUFFER_SIZE_FACTOR);
+            // Use MIC instead of VOICE_COMMUNICATION to avoid aggressive processing that might cause static
+            audioRecord = new AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, CHANNEL_CONFIG_IN, AUDIO_FORMAT, minBufferSizeIn * BUFFER_SIZE_FACTOR);
 
             if (AcousticEchoCanceler.isAvailable()) {
                 aec = AcousticEchoCanceler.create(audioRecord.getAudioSessionId());
@@ -125,9 +136,10 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
                 }
             }
 
-            // Initialize AudioTrack
+            // Initialize AudioTrack with minimum buffer for low latency
+            // Our jitter buffer handles buffering, so we don't need a large hardware buffer
             minBufferSizeOut = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG_OUT, AUDIO_FORMAT);
-            audioTrack = new AudioTrack(AudioManager.STREAM_VOICE_CALL, SAMPLE_RATE, CHANNEL_CONFIG_OUT, AUDIO_FORMAT, minBufferSizeOut * BUFFER_SIZE_FACTOR, AudioTrack.MODE_STREAM);
+            audioTrack = new AudioTrack(AudioManager.STREAM_VOICE_CALL, SAMPLE_RATE, CHANNEL_CONFIG_OUT, AUDIO_FORMAT, minBufferSizeOut, AudioTrack.MODE_STREAM);
 
             audioRecord.startRecording();
             audioTrack.play();
@@ -269,10 +281,14 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
         useOpus = "opus".equals(codec);
         Log.d(TAG, "Codec set to " + codec);
         
-        if (useOpus && !wasOpus && opusCodec == null) {
-            opusCodec = new OpusCodec();
-            opusCodec.init();
-            opusCodec.setBitrate(opusBitrate);
+        if (useOpus) {
+            // Switched to Opus (or reaffirming Opus) -> (re)create encoder/decoder
+            // Always setup codec to ensure it's properly initialized
+            if (opusCodec == null) {
+                opusCodec = new OpusCodec();
+                opusCodec.init();
+                opusCodec.setBitrate(opusBitrate);
+            }
         }
     }
 
@@ -292,8 +308,40 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
             Log.d(TAG, "PCM bit depth set to " + bitDepth + "-bit");
         } else {
             Log.e(TAG, "Invalid bit depth " + bitDepth + ", must be 8, 12, or 16");
+        }
+    }
+
+    @ReactMethod
+    public void setAutoJitter(boolean enabled) {
+        this.isAutoJitter = enabled;
         Log.d(TAG, "Auto-adjust jitter " + (enabled ? "enabled" : "disabled"));
     }
+
+    @ReactMethod
+    public void setJitterBuffer(int ms) {
+        int oldMs = this.jitterBufferMs;
+        
+        // Enforce minimum buffer of 40ms (2 packets)
+        int clampedMs = Math.max(40, ms);
+        this.jitterBufferMs = clampedMs;
+        
+        if (clampedMs != ms) {
+            Log.d(TAG, "Jitter buffer clamped from " + ms + "ms to " + clampedMs + "ms (minimum: 40ms)");
+        } else {
+            Log.d(TAG, "Jitter buffer set to " + ms + "ms");
+        }
+        
+        // If increasing buffer, force re-buffering to ensure delay is applied
+        if (clampedMs > oldMs) {
+            synchronized (audioQueue) {
+                if (!isBuffering) {
+                    Log.d(TAG, "Buffer increased, forcing re-buffer");
+                    isBuffering = true;
+                }
+            }
+        }
+    }
+
 
     private void startJitterHandler() {
         jitterRunnable = new Runnable() {
@@ -304,6 +352,10 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
             }
         };
         jitterHandler.post(jitterRunnable);
+    }
+
+    private void processJitterBuffer() {
+        processAudioQueue();
     }
 
     private void processAudioQueue() {
@@ -460,7 +512,21 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
         recordingThread = new Thread(new Runnable() {
             @Override
             public void run() {
+                Log.d(TAG, "Recording thread started. Min buffer size: " + minBufferSizeIn);
                 byte[] buffer = new byte[minBufferSizeIn];
+                
+                // Accumulator for Opus encoding
+                // We need exactly 960 samples (1920 bytes) for 20ms Opus frame
+                // But AudioRecord might give us more or less
+                
+                // Use a larger buffer to accumulate samples
+                short[] accumulator = new short[9600]; // 10 frames worth
+                int accumulatorCount = 0;
+                
+                // Stats for bitrate monitoring
+                long totalOpusBytes = 0;
+                int opusPacketCount = 0;
+                
                 while (isRunning.get()) {
                     int read = audioRecord.read(buffer, 0, minBufferSizeIn);
                     if (read > 0) {
@@ -488,24 +554,58 @@ public class AudioEngineModule extends ReactContextBaseJavaModule {
                             }
                             // Normalize to 0.0 - 1.0
                             double level = (double) maxAmp / 32768.0;
-                            sendEvent("onAudioLevel", String.valueOf(level)); // Sending as string to avoid type issues, or could send double if supported
+                            sendEvent("onAudioLevel", String.valueOf(level)); 
                             lastLevelSendTime = now;
                         }
                         
                         if (useOpus && opusCodec != null) {
-                            // Convert byte[] to short[]
-                            short[] pcm = new short[read / 2];
-                            for (int i = 0; i < pcm.length; i++) {
-                                pcm[i] = (short) ((processBuffer[i * 2 + 1] << 8) | (processBuffer[i * 2] & 0xFF));
+                            // Convert input byte[] to short[]
+                            int inputSamples = read / 2;
+                            for (int i = 0; i < inputSamples; i++) {
+                                short sample = (short) ((processBuffer[i * 2 + 1] << 8) | (processBuffer[i * 2] & 0xFF));
+                                
+                                // Add to accumulator
+                                if (accumulatorCount < accumulator.length) {
+                                    accumulator[accumulatorCount++] = sample;
+                                }
                             }
                             
-                            byte[] opusData = opusCodec.encodeFrame(pcm);
-                            if (opusData != null) {
-                                String base64Data = Base64.encodeToString(opusData, Base64.NO_WRAP);
-                                sendEvent("onAudioData", base64Data);
+                            // Process full frames (960 samples)
+                            while (accumulatorCount >= 960) {
+                                short[] frame = new short[960];
+                                System.arraycopy(accumulator, 0, frame, 0, 960);
+                                
+                                // Shift accumulator
+                                System.arraycopy(accumulator, 960, accumulator, 0, accumulatorCount - 960);
+                                accumulatorCount -= 960;
+                                
+                                // Encode frame
+                                byte[] opusData = opusCodec.encodeFrame(frame);
+                                if (opusData != null) {
+                                    // Update stats
+                                    totalOpusBytes += opusData.length;
+                                    opusPacketCount++;
+                                    
+                                    // Log every 50 packets (~1 second)
+                                    if (opusPacketCount >= 50) {
+                                        double avgSize = (double) totalOpusBytes / opusPacketCount;
+                                        // 50 packets * 20ms = 1 second. Total bytes * 8 = bits per second.
+                                        double bitrate = totalOpusBytes * 8; 
+                                        Log.d(TAG, String.format("Opus Stats: Avg packet size=%.1f bytes, Bitrate=%.1f kbps", avgSize, bitrate / 1000.0));
+                                        
+                                        totalOpusBytes = 0;
+                                        opusPacketCount = 0;
+                                    }
+                                    
+                                    String base64Data = Base64.encodeToString(opusData, Base64.NO_WRAP);
+                                    sendEvent("onAudioData", base64Data);
+                                }
                             }
                         } else {
                             // PCM encoding - reduce bit depth if needed
+                            // For PCM, we can just send whatever we have, but maybe we should also chunk it?
+                            // Server mixer handles arbitrary PCM chunks fine usually.
+                            
                             byte[] finalData;
                             if (pcmBitDepth == 16) {
                                 finalData = processBuffer;

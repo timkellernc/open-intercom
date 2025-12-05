@@ -1,4 +1,4 @@
-import { NativeModules, NativeEventEmitter } from 'react-native';
+import { NativeModules, NativeEventEmitter, Platform, PermissionsAndroid } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { webSocketService } from './WebSocketService';
 
@@ -9,6 +9,8 @@ console.log('AudioEngine module:', AudioEngine);
 class AudioService {
     private eventEmitter: NativeEventEmitter | null = null;
     private isRecording = false;
+    private talkChannels: number[] = [];
+    private listenChannels: number[] = [];
 
     constructor() {
         if (!AudioEngine) {
@@ -18,6 +20,27 @@ class AudioService {
         this.eventEmitter = new NativeEventEmitter(AudioEngine);
         this.setupListeners();
         this.loadSettings();
+    }
+
+    public async requestPermission(): Promise<boolean> {
+        if (Platform.OS !== 'android') return true;
+
+        try {
+            const granted = await PermissionsAndroid.request(
+                PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+                {
+                    title: 'Microphone Permission',
+                    message: 'OpenIntercom needs access to your microphone to transmit audio.',
+                    buttonNeutral: 'Ask Me Later',
+                    buttonNegative: 'Cancel',
+                    buttonPositive: 'OK',
+                },
+            );
+            return granted === PermissionsAndroid.RESULTS.GRANTED;
+        } catch (err) {
+            console.warn(err);
+            return false;
+        }
     }
 
     private async loadSettings() {
@@ -76,7 +99,7 @@ class AudioService {
                 // Convert base64 to binary and send via WebSocket
                 const binaryData = this.base64ToArrayBuffer(base64Audio);
                 // console.log('AudioService: Sending audio to WebSocket, bytes:', binaryData.byteLength);
-                webSocketService.sendAudio(binaryData);
+                webSocketService.sendAudio(binaryData, this.talkChannels);
             }
         });
 
@@ -86,15 +109,22 @@ class AudioService {
         });
 
         // Listen for incoming audio from WebSocket
-        webSocketService.on('audio', (audioData: ArrayBuffer) => {
+        webSocketService.on('audio', (data: { audioData: ArrayBuffer, channelIds: number[] }) => {
             // console.log('AudioService: Received audio from WebSocket, bytes:', audioData.byteLength);
-            this.playAudio(audioData);
+            this.playAudio(data.audioData);
         });
         console.log('AudioService: Listeners setup complete');
     }
 
     async startRecording() {
         if (!AudioEngine) return;
+
+        const hasPermission = await this.requestPermission();
+        if (!hasPermission) {
+            console.log('AudioService: Microphone permission denied');
+            return;
+        }
+
         console.log('AudioService: Start recording');
         this.isRecording = true;
         AudioEngine.start();
@@ -180,6 +210,17 @@ class AudioService {
         if (AudioEngine.setPCMBitDepth) {
             AudioEngine.setPCMBitDepth(bitDepth);
         }
+    }
+
+    setTalkChannels(channels: number[]) {
+        this.talkChannels = channels;
+        console.log('AudioService: Set talk channels', channels);
+    }
+
+    setListenChannels(channels: number[]) {
+        this.listenChannels = channels;
+        console.log('AudioService: Set listen channels', channels);
+        webSocketService.sendChannelSubscription(this.listenChannels, this.talkChannels);
     }
 
     private arrayBufferToBase64(buffer: ArrayBuffer): string {

@@ -26,18 +26,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     onClose,
     onLogout,
 }) => {
-    const [jitterBufferMs, setJitterBufferMs] = useState(50);
+    const [jitterBufferMs, setJitterBufferMs] = useState(100);
     const [isAutoJitter, setIsAutoJitter] = useState(true);
     const [audioQuality, setAudioQuality] = useState('quality'); // eco, balanced, quality
     const [volume, setVolume] = useState(2.0); // Default 2.0x
     const [micGain, setMicGain] = useState(1.0); // Default 1.0x (no change)
     const [audioLevel, setAudioLevel] = useState(0.0);
-
     const [useOpus, setUseOpus] = useState(true); // Default to Opus
+    const [scrollEnabled, setScrollEnabled] = useState(true);
 
-
-
-    // Listen for jitter buffer changes from native module
     // Listen for jitter buffer changes from native module
     useEffect(() => {
         const { AudioEngine } = NativeModules;
@@ -75,19 +72,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             if (savedAuto) setIsAutoJitter(savedAuto === 'true');
             if (savedQuality) {
                 setAudioQuality(savedQuality);
-                // Don't apply settings here - they're already applied from previous session
             }
             if (savedVolume) {
                 setVolume(parseFloat(savedVolume));
-                // Don't call audioService.setVolume here - only update UI state
             }
             if (savedMicGain) {
                 setMicGain(parseFloat(savedMicGain));
-                // Don't call audioService.setMicGain here - only update UI state
             }
             if (savedUseOpus) {
                 setUseOpus(savedUseOpus === 'true');
-                // Don't call audioService.setCodec here - only update UI state
             }
         } catch (error) {
             console.error('Failed to load settings', error);
@@ -115,6 +108,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     const handleVolumeChange = (newVolume: number) => {
         setVolume(newVolume);
+        console.log('SettingsModal: Volume changed to', newVolume);
         audioService.setVolume(newVolume);
     };
 
@@ -172,6 +166,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const handleJitterChangeComplete = (value: number) => {
         setJitterBufferMs(value);
         audioService.setJitterBuffer(value);
+        setScrollEnabled(true);
     };
 
     const handleAutoJitterToggle = (value: boolean) => {
@@ -195,7 +190,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         </TouchableOpacity>
                     </View>
 
-                    <ScrollView style={styles.scrollContent}>
+                    <ScrollView
+                        style={styles.scrollContent}
+                        showsVerticalScrollIndicator={false}
+                        scrollEnabled={scrollEnabled}
+                    >
                         {/* Jitter Buffer Settings */}
                         <View style={styles.section}>
                             <Text style={styles.sectionTitle}>Jitter Buffer</Text>
@@ -213,7 +212,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <View style={styles.sliderContainer}>
                                 <View style={styles.row}>
                                     <Text style={styles.label}>Buffer Size</Text>
-                                    <Text style={styles.value}>{jitterBufferMs} ms</Text>
+                                    <View style={styles.buttonGroup}>
+                                        <TouchableOpacity
+                                            style={[styles.adjustButton, isAutoJitter && styles.adjustButtonDisabled]}
+                                            onPress={() => {
+                                                if (!isAutoJitter) {
+                                                    const newValue = Math.max(40, jitterBufferMs - 20);
+                                                    handleJitterChangeComplete(newValue);
+                                                }
+                                            }}
+                                            disabled={isAutoJitter}
+                                        >
+                                            <Text style={styles.adjustButtonText}>-</Text>
+                                        </TouchableOpacity>
+                                        <Text style={styles.value}>{jitterBufferMs} ms</Text>
+                                        <TouchableOpacity
+                                            style={[styles.adjustButton, isAutoJitter && styles.adjustButtonDisabled]}
+                                            onPress={() => {
+                                                if (!isAutoJitter) {
+                                                    const newValue = Math.min(500, jitterBufferMs + 20);
+                                                    handleJitterChangeComplete(newValue);
+                                                }
+                                            }}
+                                            disabled={isAutoJitter}
+                                        >
+                                            <Text style={styles.adjustButtonText}>+</Text>
+                                        </TouchableOpacity>
+                                    </View>
                                 </View>
                                 <Slider
                                     style={styles.slider}
@@ -224,9 +249,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                     onValueChange={handleJitterChange}
                                     onSlidingComplete={handleJitterChangeComplete}
                                     disabled={isAutoJitter}
-                                    minimumTrackTintColor={colors.primary}
+                                    minimumTrackTintColor={isAutoJitter ? colors.textSecondary : colors.primary}
                                     maximumTrackTintColor={colors.surface}
-                                    thumbTintColor={isAutoJitter ? colors.textSecondary : 'white'}
+                                    thumbTintColor={isAutoJitter ? colors.textSecondary : colors.primary}
+                                    tapToSeek={true}
                                 />
                             </View>
                         </View>
@@ -238,7 +264,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <View style={styles.sliderContainer}>
                                 <View style={styles.row}>
                                     <Text style={styles.label}>Playback Volume</Text>
-                                    <Text style={styles.value}>{volume.toFixed(1)}x</Text>
+                                    <View style={styles.buttonGroup}>
+                                        <TouchableOpacity
+                                            style={styles.adjustButton}
+                                            onPress={() => {
+                                                const newValue = Math.max(0.5, volume - 0.5);
+                                                handleVolumeChange(newValue);
+                                            }}
+                                        >
+                                            <Text style={styles.adjustButtonText}>-</Text>
+                                        </TouchableOpacity>
+                                        <Text style={styles.value}>{volume.toFixed(1)}x</Text>
+                                        <TouchableOpacity
+                                            style={styles.adjustButton}
+                                            onPress={() => {
+                                                const newValue = Math.min(4.0, volume + 0.5);
+                                                handleVolumeChange(newValue);
+                                            }}
+                                        >
+                                            <Text style={styles.adjustButtonText}>+</Text>
+                                        </TouchableOpacity>
+                                    </View>
                                 </View>
                                 <Slider
                                     style={styles.slider}
@@ -249,7 +295,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                     onValueChange={handleVolumeChange}
                                     minimumTrackTintColor={colors.primary}
                                     maximumTrackTintColor={colors.surface}
-                                    thumbTintColor={'white'}
+                                    thumbTintColor={colors.primary}
+                                    tapToSeek={true}
                                 />
                                 <Text style={styles.optionDesc}>
                                     Adjust how loud incoming audio sounds (0.5x - 4.0x)
@@ -259,18 +306,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <View style={styles.sliderContainer}>
                                 <View style={styles.row}>
                                     <Text style={styles.label}>Microphone Gain</Text>
-                                    <Text style={styles.value}>{micGain.toFixed(1)}x</Text>
+                                    <View style={styles.buttonGroup}>
+                                        <TouchableOpacity
+                                            style={styles.adjustButton}
+                                            onPress={() => {
+                                                const newValue = Math.max(0.5, micGain - 0.5);
+                                                handleMicGainChange(newValue);
+                                            }}
+                                        >
+                                            <Text style={styles.adjustButtonText}>-</Text>
+                                        </TouchableOpacity>
+                                        <Text style={styles.value}>{micGain.toFixed(1)}x</Text>
+                                        <TouchableOpacity
+                                            style={styles.adjustButton}
+                                            onPress={() => {
+                                                const newValue = Math.min(10.0, micGain + 0.5);
+                                                handleMicGainChange(newValue);
+                                            }}
+                                        >
+                                            <Text style={styles.adjustButtonText}>+</Text>
+                                        </TouchableOpacity>
+                                    </View>
                                 </View>
                                 <Slider
                                     style={styles.slider}
-                                    minimumValue={0.5}
-                                    maximumValue={3.0}
+                                    minimumValue={0.1}
+                                    maximumValue={10.0}
                                     step={0.1}
                                     value={micGain}
                                     onValueChange={handleMicGainChange}
                                     minimumTrackTintColor={colors.primary}
                                     maximumTrackTintColor={colors.surface}
-                                    thumbTintColor={'white'}
+                                    thumbTintColor={colors.primary}
+                                    tapToSeek={true}
                                 />
                                 <Text style={styles.optionDesc}>
                                     Amplify your microphone before sending (0.5x - 3.0x)
@@ -474,5 +542,26 @@ const styles = StyleSheet.create({
     meterBar: {
         height: '100%',
         backgroundColor: colors.success,
+    },
+    buttonGroup: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: spacing.sm,
+    },
+    adjustButton: {
+        width: 32,
+        height: 32,
+        borderRadius: 16,
+        backgroundColor: colors.primary,
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    adjustButtonDisabled: {
+        backgroundColor: colors.surface,
+    },
+    adjustButtonText: {
+        color: 'white',
+        fontSize: 18,
+        fontWeight: 'bold',
     },
 });
